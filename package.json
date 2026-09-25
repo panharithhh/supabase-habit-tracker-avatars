@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test:rls": "node --test scripts/rls.test.mjs"
+    "test:rls": "node --test scripts/rls.test.mjs scripts/avatars.test.mjs scripts/avatar-validation.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.1",
