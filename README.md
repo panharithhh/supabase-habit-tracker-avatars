@@ -145,6 +145,22 @@ Postgres, so PGlite can't test them. They are set on the live bucket
 (`file_size_limit`, `allowed_mime_types`) and apply to every upload, including
 one that skips the app entirely.
 
+### Checked on the live project
+
+Signed in as a real user, these uploads went straight to the Storage API,
+skipping `validateAvatar`:
+
+| Direct upload | Supabase's answer |
+|---|---|
+| 5.6 MB PNG into your own folder | `The object exceeded the maximum allowed size` |
+| PDF into your own folder | `mime type application/pdf is not supported` |
+| PNG into another user's folder | `new row violates row-level security policy` |
+| PNG outside any folder | `new row violates row-level security policy` |
+
+After uploading two different photos through the app, the bucket holds one
+object, `<your id>/avatar`: `upsert: true` replaced the first photo instead of
+adding a second file.
+
 ## Deliverables
 
 Screenshots are in [`docs/screenshots/`](docs/screenshots/).
@@ -166,6 +182,10 @@ Screenshots are in [`docs/screenshots/`](docs/screenshots/).
 card is replaced. The nav, profile and habit list keep working.
 
 ![Stats boundary](docs/screenshots/14-boundary-stats.png)
+
+After **Try again**, the stats render normally:
+
+![Stats after retry](docs/screenshots/15-boundary-retry.png)
 
 **Why client-side validation is UX and the storage policy is the security:**
 
