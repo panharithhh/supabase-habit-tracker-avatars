@@ -1,9 +1,18 @@
-# Habit Tracker: Supabase Auth + Row Level Security
+# Habit Tracker: avatar uploads + error boundaries
 
-A React 19 + TypeScript (Vite) habit tracker. You sign in with email and
-password, add habits, and tick off days. There is no backend server: the
-browser talks to Supabase Postgres directly with a public key, so **the two
-RLS policies are the only thing keeping each user's data private**.
+A React 19 + TypeScript (Vite) habit tracker on Supabase. This step adds two
+things that make the app hold up against bad input and broken code:
+
+1. **Avatar upload.** Pick an image, see a preview, and upload it to a public
+   `avatars` bucket. Wrong types and files over 1 MB are refused politely,
+   in the page. A storage policy keeps every user inside their own folder.
+2. **Error boundaries.** The nav, profile photo, stats and habit list each sit
+   in their own `ErrorBoundary`. If one crashes, only that section is replaced
+   by its fallback card with a **Try again** button. The rest of the page keeps
+   working.
+
+It builds on the [Auth + RLS habit tracker](https://github.com/panharithhh/supabase-habit-tracker):
+email sign-in, and RLS so each user only ever sees their own habits.
 
 ## Run it
 
@@ -11,101 +20,176 @@ RLS policies are the only thing keeping each user's data private**.
 npm install
 cp .env.example .env    # then fill in the two values (see setup below)
 npm run dev             # http://localhost:5173
-npm run test:rls        # proves the policies, no Supabase project needed
+npm run test:rls        # 29 tests: policies, storage policy, file checks. No Supabase project needed
 npm run build           # tsc -b && vite build
 ```
 
 ## One-time Supabase setup
 
 1. **Create a project** at <https://supabase.com/dashboard> → New project.
-2. **Run the schema.** SQL Editor → New query → paste all of
-   [`supabase/schema.sql`](supabase/schema.sql) → Run. This creates both
-   tables, the cascade, the grants and the two policies.
+2. **Run the SQL.** SQL Editor → New query → paste all of
+   [`supabase/schema.sql`](supabase/schema.sql) → Run. Then do the same with
+   [`supabase/avatars.sql`](supabase/avatars.sql). This creates the `profiles`
+   table, the `avatars` bucket and its storage policy.
 3. **Make test accounts easy.** Authentication → Sign In / Providers → Email →
-   turn **Confirm email** off. With it on, sign-up works, but each account has
-   to click a link in a real inbox before it can sign in.
+   turn **Confirm email** off.
 4. **Copy the keys.** Project Settings → API Keys. Put the Project URL and the
-   **publishable** key (`sb_publishable_…`, or the legacy `anon` key on older
-   projects) into `.env`. Never use the secret / `service_role` key: it
-   bypasses RLS, and Vite ships every `VITE_` variable to the browser.
+   **publishable** key into `.env`. Never the secret / `service_role` key: it
+   bypasses every policy, and Vite ships every `VITE_` variable to the browser.
 
-## How the data is protected
+## Avatar upload
 
-| Table | Columns | Policy |
+The flow in [`AvatarUpload.tsx`](src/components/AvatarUpload.tsx) and
+[`useProfile.ts`](src/lib/useProfile.ts):
+
+1. **Pick a file.** The `accept` attribute filters the file picker, but anyone
+   can switch it to "All files", so it isn't relied on.
+2. **Validate it** with [`validateAvatar`](src/lib/avatar.ts). The file must be
+   PNG, JPEG, WebP or GIF, and at most 1 MB (1,048,576 bytes). A rejected file
+   gets an inline message naming the file and the problem, for example
+   *“earth-wallpaper.png” is 5.8 MB. Choose an image of 1 MB or less.* SVG
+   (it can carry scripts) and HEIC (most browsers can't show it) aren't allowed.
+3. **Preview it.** `URL.createObjectURL(file)` shows the image before anything
+   is uploaded, with a dashed ring and a *Preview* badge. The blob URL is
+   revoked when the file changes or the card unmounts. If the file says it's
+   an image but can't be decoded, the preview's `onError` rejects it too.
+4. **Upload** to `avatars/<user id>/avatar` with `upsert: true`, so a new photo
+   replaces the old one.
+5. **Save** the public URL to `profiles.avatar_url`. The path never changes,
+   so a `?v=<timestamp>` is added to get past cached copies of the old image.
+6. **Render on mount.** On every page load, `useProfile` reads `avatar_url`
+   from the database and the nav and profile card show it. If the image fails
+   to load, they fall back to the email's first letter.
+
+### Where the rules are enforced
+
+| Rule | In the browser (UX) | On Supabase (security) |
 |---|---|---|
-| `habits` | `id`, `user_id`, `name`, `created_at` | **Users manage their own habits**: `for all to authenticated using (auth.uid() = user_id) with check (auth.uid() = user_id)` |
-| `habit_logs` | `id`, `habit_id → habits on delete cascade`, `user_id`, `done_on`, `created_at` | **Users manage their own habit logs**: same rule, and `with check` also requires that the `habit_id` belongs to you |
+| Images only | `validateAvatar` checks `file.type` | bucket `allowed_mime_types`: png, jpeg, webp, gif |
+| At most 1 MB | `validateAvatar` checks `file.size` | bucket `file_size_limit`: 1048576 |
+| Only your own folder | the app always uses `<your id>/avatar` | storage policy: `(storage.foldername(name))[1] = auth.uid()::text` |
+| Only your own `avatar_url` | the app sends your id | `profiles` RLS: `auth.uid() = id` |
 
-- `using` decides which rows you can **see, update, delete**. `with check`
-  decides which rows you can **write**. With both in place you can't read other
-  people's rows, plant rows under someone else's `user_id`, or move your own
-  rows over to another user.
-- `user_id` defaults to `auth.uid()`, so the client never sends it. The React
-  code has no `.eq('user_id', …)` filters: RLS already does the filtering.
-- Anonymous (signed-out) requests are revoked outright and get
-  `permission denied`.
-- `on delete cascade` on `habit_logs.habit_id` means deleting a habit deletes
-  its logs in the database, not just on screen.
+The storage policy, from [`supabase/avatars.sql`](supabase/avatars.sql):
 
-### Proving it: `npm run test:rls`
-
-[`scripts/rls.test.mjs`](scripts/rls.test.mjs) loads the real
-`supabase/schema.sql` into an in-memory Postgres
-([PGlite](https://pglite.dev)) with a stand-in for Supabase's `auth.uid()` and
-roles. It then acts as two users and a signed-out visitor:
-
-```
-✔ Alice can create a habit without sending user_id, and log it
-✔ Alice sees her own habit
-✔ Bob's habit list is EMPTY, not an error
-✔ Bob can't read Alice's habit even by its exact id
-✔ Bob can't create a habit owned by Alice
-✔ Bob can't log a check-in against Alice's habit
-✔ Bob can't rename or delete Alice's habit (0 rows affected)
-✔ Bob can't move a row he owns over to Alice
-✔ anonymous requests are refused outright
-✔ one check-in per habit per day
-✔ deleting a habit removes its logs (checked past RLS, as superuser)
-ℹ tests 11 · pass 11 · fail 0
+```sql
+create policy "Users manage avatars in their own folder"
+  on storage.objects
+  for all
+  to authenticated
+  using (
+    bucket_id = 'avatars'
+    and (storage.foldername(name))[1] = (select auth.uid()::text)
+  )
+  with check (
+    bucket_id = 'avatars'
+    and (storage.foldername(name))[1] = (select auth.uid()::text)
+  );
 ```
 
-If you add `disable row level security` for both tables to the end of the
-schema, 8 of the 11 tests fail. So the tests really are testing RLS.
+`for all` matters: `upload` needs INSERT, but `upsert: true` also needs SELECT
+and UPDATE. The bucket is **public**, which only means anyone with the URL can
+*view* a file (as `<img src>` needs). Every write still has to pass the policy,
+and nobody can list another user's folder.
 
-## Audit checklist
+## Error boundaries
 
-| Check | How to verify | Why it holds |
+[`ErrorBoundary`](src/components/ErrorBoundary.tsx) is a reusable class
+component (`getDerivedStateFromError` + `componentDidCatch`). It takes a
+`fallback` render function that receives `{ error, reset }`, and an optional
+`onReset`. [`App.tsx`](src/App.tsx) wraps each section in its own boundary with
+its own fallback copy:
+
+| Section | Fallback says | Extra |
 |---|---|---|
-| `git status` shows no `.env` | `git status` and `git ls-files \| grep .env` show only `.env.example` | `.gitignore` covers `.env` and `.env.*`. `scripts/push-to-github.sh` also refuses to push if a `.env` is ever tracked |
-| A second account sees an EMPTY list, not an error | Sign out, create a second account. It shows "No habits yet." | RLS filters rows instead of rejecting the query, so Supabase returns `[]`. The UI treats `[]` as the empty state and shows errors separately |
-| Deleting a habit removes its logs | Delete a habit, then in SQL Editor run `select count(*) from habit_logs where habit_id = '<id>'`. The result is `0` | `habit_id … references habits on delete cascade` |
-| Refresh loses nothing | Add habits, tick days, press ⌘R. You stay signed in and everything is still there | Every read comes from Supabase, never from component state. supabase-js keeps the session in localStorage |
+| Nav | The top bar didn't load | a **Sign out** button, so you're never stuck |
+| Profile photo | Profile photo is unavailable | "Nothing was uploaded" |
+| Stats | Stats couldn't be shown | "Your habits below are safe" |
+| Habit list | Your habit list hit a problem | "Every check-in is saved" |
+
+Every fallback has **Try again**, which re-renders the section. A last-resort
+boundary in [`main.tsx`](src/main.tsx) wraps the whole app. The habit and
+profile data live in hooks *above* the boundaries, so a crash and a retry never
+lose what the other sections are showing.
+
+Boundaries only catch errors thrown while rendering. Errors in event handlers
+and async code, like a failed upload, are caught where they happen and shown
+inline.
+
+**See it yourself:** in `npm run dev`, open
+`http://localhost:5173/?crash=stats` (or `nav`, `profile`, `habits`, or several
+comma-separated). That section throws on purpose. **Try again** clears the
+switch, so the retry works. The switch is behind `import.meta.env.DEV`, so
+production builds don't contain it.
+
+## Tests
+
+`npm run test:rls` runs three files, with no Supabase project needed:
+
+- [`scripts/avatars.test.mjs`](scripts/avatars.test.mjs) loads the real
+  `supabase/avatars.sql` into an in-memory Postgres ([PGlite](https://pglite.dev))
+  with stand-ins for Supabase's `auth` and `storage` schemas. As two users and
+  a signed-out visitor, it checks that you can upload and upsert only in your
+  own folder, can't overwrite, move, delete or list anyone else's files, can't
+  upload outside a folder or to another bucket, and can only set your own
+  `avatar_url`. If you remove the folder check from the policy, 5 of its 12
+  tests fail.
+- [`scripts/avatar-validation.test.mjs`](scripts/avatar-validation.test.mjs)
+  checks `validateAvatar`: exactly 1 MB passes, one byte more fails, and PDF,
+  text, SVG, HEIC and empty files are rejected.
+- [`scripts/rls.test.mjs`](scripts/rls.test.mjs) is the habits RLS suite from
+  the previous step.
+
+The bucket's size and type limits are enforced by the Storage server, not
+Postgres, so PGlite can't test them. They are set on the live bucket
+(`file_size_limit`, `allowed_mime_types`) and apply to every upload, including
+one that skips the app entirely.
 
 ## Deliverables
 
-**Screenshots** (in [`docs/screenshots/`](docs/screenshots/)):
+Screenshots are in [`docs/screenshots/`](docs/screenshots/).
 
-1. `01-habit-list.png`: the signed-in habit list
-2. `02-second-account-empty.png`: the second account's empty list
-3. `03-sql-editor-policies.png`: the SQL editor showing both policies. Run
-   [`supabase/show-policies.sql`](supabase/show-policies.sql) to list them.
+**Preview before upload:** the chosen file, its size, and "not uploaded yet".
 
-**If RLS were disabled once the app is deployed:**
+![Preview state](docs/screenshots/10-avatar-preview.png)
 
-> Anyone could copy the project URL and public key out of the deployed site's
-> JavaScript, sign up for a free account, and call the Supabase REST API
-> directly to read, rewrite, or delete every user's habits and logs.
+**Rejected files:** too big, and not an image.
+
+![File over 1 MB rejected](docs/screenshots/11-avatar-rejected-too-big.png)
+![PDF rejected](docs/screenshots/12-avatar-rejected-wrong-type.png)
+
+**Avatar on a fresh load**, read back from `profiles.avatar_url`:
+
+![Avatar after reload](docs/screenshots/13-avatar-after-reload.png)
+
+**A boundary in action:** the stats section throws (`?crash=stats`). Only its
+card is replaced. The nav, profile and habit list keep working.
+
+![Stats boundary](docs/screenshots/14-boundary-stats.png)
+
+**Why client-side validation is UX and the storage policy is the security:**
+
+> Client-side validation runs in a browser the user controls and can be
+> skipped with a single direct API call, so it only spares honest users a
+> wasted upload and gives them a clear message, while the storage policy and
+> bucket limits run on Supabase's servers for every request, whatever sent it,
+> so they are what actually keeps bad files and other people's folders safe.
 
 ## Project layout
 
 ```
-supabase/schema.sql          tables, cascade, grants, the two RLS policies
-supabase/show-policies.sql   query for the policies screenshot
-scripts/rls.test.mjs         RLS tests against the real schema (PGlite)
-scripts/push-to-github.sh    creates the GitHub repo and pushes
-src/lib/supabase.ts          client created from .env
-src/lib/useSession.ts        session state via onAuthStateChange
-src/lib/dates.ts             local-time dates and streaks
-src/components/AuthForm.tsx  sign in / create account
-src/components/HabitList.tsx add, check in, delete; empty and error states
+supabase/schema.sql               habits + habit_logs, grants, RLS
+supabase/avatars.sql              profiles, avatars bucket, storage policy
+scripts/*.test.mjs                policy and validation tests (npm run test:rls)
+src/lib/avatar.ts                 file rules: types, 1 MB, path, messages
+src/lib/useProfile.ts             load avatar_url on mount, upload + save
+src/lib/useHabits.ts              habit reads and writes, shared by list and stats
+src/lib/crashTest.ts              dev-only ?crash=<section> switch
+src/components/ErrorBoundary.tsx  reusable class boundary
+src/components/SectionFallback.tsx fallback card with Try again
+src/components/AvatarUpload.tsx   pick, validate, preview, upload
+src/components/Avatar.tsx         round avatar with a letter fallback
+src/components/Nav.tsx            top bar with avatar and sign out
+src/components/Stats.tsx          done today, last 7 days, best streak
+src/components/HabitList.tsx      add, check in, delete
 ```
